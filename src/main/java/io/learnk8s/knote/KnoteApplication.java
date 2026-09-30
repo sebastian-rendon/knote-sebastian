@@ -1,6 +1,9 @@
 package io.learnk8s.knote;
 
-
+import io.minio.BucketExistsArgs;
+import io.minio.MakeBucketArgs;
+import io.minio.MinioClient;
+import io.minio.PutObjectArgs;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -14,6 +17,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.mapping.Document;
@@ -24,26 +28,20 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
-import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
-import org.springframework.web.servlet.resource.PathResourceResolver;
 
-import java.io.File;
+import java.io.InputStream;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
 @SpringBootApplication
 public class KnoteApplication {
-
     public static void main(String[] args) {
         SpringApplication.run(KnoteApplication.class, args);
     }
-
 }
 
 interface NotesRepository extends MongoRepository<Note, String> {
-
 }
 
 @Document(collection = "notes")
@@ -62,32 +60,43 @@ class Note {
     }
 }
 
+@ConfigurationProperties(prefix = "knote")
+class KnoteProperties {
+    @Value("${minio.host:minio}")
+    private String minioHost;
+
+    @Value("${minio.port:9000}")
+    private int minioPort;
+
+    @Value("${minio.access-key:minioAccessKey}")
+    private String minioAccessKey;
+
+    @Value("${minio.secret-key:minioSecretKey}")
+    private String minioSecretKey;
+
+    @Value("${minio.bucket:knote}")
+    private String minioBucket;
+
+    public String getMinioHost() { return minioHost; }
+    public int getMinioPort() { return minioPort; }
+    public String getMinioAccessKey() { return minioAccessKey; }
+    public String getMinioSecretKey() { return minioSecretKey; }
+    public String getMinioBucket() { return minioBucket; }
+}
+
 @Configuration
 @EnableConfigurationProperties(KnoteProperties.class)
-class KnoteConfig implements WebMvcConfigurer {
+class KnoteConfig {
 
     @Autowired
     private KnoteProperties properties;
 
-    @Override
-    public void addResourceHandlers(ResourceHandlerRegistry registry) {
-        registry
-                .addResourceHandler("/uploads/**")
-                .addResourceLocations("file:" + properties.getUploadDir())
-                .setCachePeriod(3600)
-                .resourceChain(true)
-                .addResolver(new PathResourceResolver());
-    }
-
-}
-
-@ConfigurationProperties(prefix = "knote")
-class KnoteProperties {
-    @Value("${uploadDir:/tmp/uploads/}")
-    private String uploadDir;
-
-    public String getUploadDir() {
-        return uploadDir;
+    @Bean
+    public MinioClient minioClient() {
+        return MinioClient.builder()
+                .endpoint("http://" + properties.getMinioHost() + ":" + properties.getMinioPort())
+                .credentials(properties.getMinioAccessKey(), properties.getMinioSecretKey())
+                .build();
     }
 }
 
@@ -96,12 +105,15 @@ class KNoteController {
 
     @Autowired
     private NotesRepository notesRepository;
+
+    @Autowired
+    private MinioClient minioClient;
+
     @Autowired
     private KnoteProperties properties;
 
     private Parser parser = Parser.builder().build();
     private HtmlRenderer renderer = HtmlRenderer.builder().build();
-
 
     @GetMapping("/")
     public String index(Model model) {
@@ -115,7 +127,6 @@ class KNoteController {
                             @RequestParam(required = false) String publish,
                             @RequestParam(required = false) String upload,
                             Model model) throws Exception {
-
         if (publish != null && publish.equals("Publish")) {
             saveNote(description, model);
             getAllNotes(model);
@@ -132,7 +143,6 @@ class KNoteController {
         return "index";
     }
 
-
     private void getAllNotes(Model model) {
         List<Note> notes = notesRepository.findAll();
         Collections.reverse(notes);
@@ -140,26 +150,38 @@ class KNoteController {
     }
 
     private void uploadImage(MultipartFile file, String description, Model model) throws Exception {
-        File uploadsDir = new File(properties.getUploadDir());
-        if (!uploadsDir.exists()) {
-            uploadsDir.mkdir();
+        String bucket = properties.getMinioBucket();
+
+        boolean bucketExists = minioClient.bucketExists(
+                BucketExistsArgs.builder().bucket(bucket).build());
+        if (!bucketExists) {
+            minioClient.makeBucket(
+                    MakeBucketArgs.builder().bucket(bucket).build());
         }
+
         String fileId = UUID.randomUUID().toString() + "." +
                 file.getOriginalFilename().split("\\.")[1];
-        file.transferTo(new File(properties.getUploadDir() + fileId));
+
+        InputStream inputStream = file.getInputStream();
+        minioClient.putObject(
+                PutObjectArgs.builder()
+                        .bucket(bucket)
+                        .object(fileId)
+                        .stream(inputStream, file.getSize(), -1)
+                        .contentType(file.getContentType())
+                        .build());
+
         model.addAttribute("description",
-                description + " ![](/uploads/" + fileId + ")");
+                description + " ![](http://" + properties.getMinioHost() +
+                ":" + properties.getMinioPort() + "/" + bucket + "/" + fileId + ")");
     }
 
     private void saveNote(String description, Model model) {
         if (description != null && !description.trim().isEmpty()) {
-            //We need to translate markup to HTML
             Node document = parser.parse(description.trim());
             String html = renderer.render(document);
             notesRepository.save(new Note(null, html));
-            //After publish you need to clean up the textarea
             model.addAttribute("description", "");
         }
     }
-
 }
